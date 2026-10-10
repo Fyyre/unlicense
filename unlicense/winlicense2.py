@@ -1,6 +1,7 @@
 import logging
 import struct
-from typing import Dict, Tuple, Any, Optional
+from bisect import bisect_right
+from typing import Dict, List, Optional, Tuple, Any
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
@@ -10,7 +11,7 @@ from .dump_utils import dump_pe, pointer_size_to_fmt
 from .emulation import resolve_wrapped_api
 from .function_hashing import compute_function_hash, EMPTY_FUNCTION_HASH
 from .process_control import (ProcessController, Architecture, MemoryRange,
-                              ReadProcessMemoryError)
+                              ReadProcessMemoryError, WriteProcessMemoryError)
 
 LOG = logging.getLogger(__name__)
 
@@ -57,9 +58,13 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
                                                 process_controller)
 
     LOG.info("Resolving imports ...")
-    _resolve_imports(api_to_calls, wrapper_set, export_hashes, md,
-                     process_controller)
+    wrapper_to_api = _resolve_imports(api_to_calls, wrapper_set, export_hashes,
+                                      md, process_controller)
     LOG.info("Imports resolved: %d", len(api_to_calls))
+
+    _collect_pointer_table_imports(api_to_calls, wrapper_to_api, exports_dict,
+                                   image_base, process_controller)
+    LOG.info("Imports including pointer tables: %d", len(api_to_calls))
 
     iat_addr, iat_size = _generate_new_iat_in_process(api_to_calls,
                                                       text_section_range.base,
@@ -74,6 +79,9 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     LOG.info("Patching call and jmp sites ...")
     _fix_import_references_in_process(api_to_calls, iat_addr,
                                       process_controller)
+    _redirect_stored_import_pointers(api_to_calls, wrapper_to_api, iat_addr,
+                                     image_base, oep, pe_file_path,
+                                     process_controller)
     # Restore memory protection to RX
     process_controller.set_memory_protection(text_section_range.base,
                                              text_section_range.size, "r-x")
@@ -126,9 +134,10 @@ def _generate_export_hashes(
 def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                      wrapper_set: WrapperSet,
                      export_hashes: Optional[Dict[int, int]], md: Cs,
-                     process_controller: ProcessController) -> None:
+                     process_controller: ProcessController) -> Dict[int, int]:
     """
     Resolve potential import wrappers by hash-matching or emulation.
+    Returns a map of wrapper address to resolved export address.
     """
     arch = process_controller.architecture
     page_size = process_controller.page_size
@@ -192,6 +201,236 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
                 (call_addr, call_size, instr_was_jmp))
         else:
             problematic_wrappers.add(wrapper_addr)
+
+    return resolved_wrappers
+
+
+def _collect_pointer_table_imports(
+        api_to_calls: ImportToCallSiteDict, wrapper_to_api: Dict[int, int],
+        exports_dict: Dict[int, Dict[str, Any]], image_base: int,
+        process_controller: ProcessController) -> None:
+    """
+    Themida 2.x keeps a table of direct pointers at its runtime import stubs.
+    Those stubs live in a private allocation and are not part of the image, so
+    a dump crashes on the first indirect call through the table.
+    """
+    known = dict(wrapper_to_api)
+    for api_addr in api_to_calls:
+        known[api_addr] = api_addr
+
+    image_end = image_base
+    chunks: List[Tuple[int, bytes]] = []
+    for mem_range in process_controller.main_module_ranges:
+        image_end = max(image_end, mem_range.base + mem_range.size)
+        try:
+            raw = process_controller.read_process_memory(mem_range.base,
+                                                         mem_range.size)
+        except ReadProcessMemoryError:
+            continue
+        chunks.append((mem_range.base, raw))
+
+    ptr_size = process_controller.pointer_size
+    ptr_fmt = pointer_size_to_fmt(ptr_size)
+    seeds = _slots_matching(chunks, ptr_size, ptr_fmt, set(known))
+    resolved_slots = {addr for addr, _ in seeds}
+    added = 0
+    for _ in range(8):
+        nearby = _slots_near(chunks, ptr_size, ptr_fmt, sorted(resolved_slots),
+                             0x14)
+        grew = False
+        seen_values = set()
+        for slot_addr, value in nearby:
+            if slot_addr in resolved_slots or value in seen_values:
+                continue
+            if image_base <= value < image_end or value < 0x10000:
+                continue
+            seen_values.add(value)
+            api_addr = known.get(value)
+            if api_addr is None:
+                api_addr = _resolve_stub_pointer(value, exports_dict,
+                                                 process_controller)
+            if api_addr is None or api_addr not in exports_dict:
+                continue
+            known[value] = api_addr
+            resolved_slots.add(slot_addr)
+            if api_addr not in api_to_calls:
+                api_to_calls[api_addr] = []
+                added += 1
+            grew = True
+        if not grew:
+            break
+
+    # Remember newly discovered stub addresses for the later rewrite.
+    wrapper_to_api.update(
+        {value: api for value, api in known.items() if value != api})
+    LOG.info("Pointer-table imports added: %d", added)
+
+
+def _slots_matching(chunks: List[Tuple[int, bytes]], ptr_size: int,
+                    ptr_fmt: str,
+                    values: set) -> List[Tuple[int, int]]:
+    found = []
+    for base, raw in chunks:
+        limit = len(raw) - ptr_size + 1
+        for offset in range(0, limit, ptr_size):
+            value = struct.unpack_from(ptr_fmt, raw, offset)[0]
+            if value in values:
+                found.append((base + offset, value))
+    return found
+
+
+def _slots_near(chunks: List[Tuple[int, bytes]], ptr_size: int, ptr_fmt: str,
+                sorted_slots: List[int],
+                window: int) -> List[Tuple[int, int]]:
+    found = []
+    if not sorted_slots:
+        return found
+    for base, raw in chunks:
+        limit = len(raw) - ptr_size + 1
+        for offset in range(0, limit, ptr_size):
+            slot_addr = base + offset
+            index = bisect_right(sorted_slots, slot_addr)
+            near = False
+            if index < len(sorted_slots) and sorted_slots[
+                    index] - slot_addr <= window:
+                near = True
+            if index > 0 and slot_addr - sorted_slots[index - 1] <= window:
+                near = True
+            if not near:
+                continue
+            value = struct.unpack_from(ptr_fmt, raw, offset)[0]
+            found.append((slot_addr, value))
+    return found
+
+
+def _resolve_stub_pointer(
+        stub_addr: int, exports_dict: Dict[int, Dict[str, Any]],
+        process_controller: ProcessController) -> Optional[int]:
+    ptr_size = process_controller.pointer_size
+    ptr_fmt = pointer_size_to_fmt(ptr_size)
+    try:
+        raw = process_controller.read_process_memory(stub_addr, 8)
+    except ReadProcessMemoryError:
+        return None
+
+    api_addr = None
+    if ptr_size == 4 and raw[:2] == b"\xff\x25":
+        slot_addr = struct.unpack_from("<I", raw, 2)[0]
+        try:
+            api_addr = struct.unpack(
+                ptr_fmt,
+                process_controller.read_process_memory(slot_addr,
+                                                       ptr_size))[0]
+        except ReadProcessMemoryError:
+            api_addr = None
+    elif ptr_size == 4 and raw[0] == 0xB8 and raw[5:7] == b"\xff\xe0":
+        api_addr = struct.unpack_from("<I", raw, 1)[0]
+
+    if api_addr in exports_dict:
+        return api_addr
+
+    emulated = resolve_wrapped_api(stub_addr, process_controller)
+    if emulated in exports_dict:
+        return emulated
+    return None
+
+
+def _redirect_stored_import_pointers(
+        api_to_calls: ImportToCallSiteDict, wrapper_to_api: Dict[int, int],
+        iat_addr: int, image_base: int, oep: int, pe_file_path: str,
+        process_controller: ProcessController) -> None:
+    """
+    Point stored wrapper/API addresses at in-image jump stubs. The stubs go
+    through the IAT, so the dump does not depend on Themida's private
+    allocation or on the system DLLs' load addresses.
+    """
+    ptr_size = process_controller.pointer_size
+    arch = process_controller.architecture
+    stub_stride = 8
+    stub_bytes_len = len(api_to_calls) * stub_stride
+    cave_addr = _import_stub_cave(process_controller, image_base, oep,
+                                  pe_file_path, stub_bytes_len)
+    if cave_addr is None or stub_bytes_len == 0:
+        LOG.info("No cave for import stubs, leaving stored pointers")
+        return
+
+    value_to_stub: Dict[int, int] = {}
+    blob = bytearray()
+    for index, api_addr in enumerate(api_to_calls):
+        stub_addr = cave_addr + index * stub_stride
+        iat_slot = iat_addr + index * ptr_size
+        value_to_stub[api_addr] = stub_addr
+        if arch == Architecture.X86_32:
+            insn = bytes([0xFF, 0x25]) + struct.pack("<I", iat_slot)
+        elif arch == Architecture.X86_64:
+            disp = iat_slot - (stub_addr + 6)
+            insn = bytes([0xFF, 0x25]) + struct.pack("<i", disp)
+        else:
+            raise NotImplementedError(f"Unsupported architecture: {arch}")
+        blob += insn + b"\x90" * (stub_stride - len(insn))
+
+    for wrapper_addr, api_addr in wrapper_to_api.items():
+        stub_addr = value_to_stub.get(api_addr)
+        if stub_addr is not None:
+            value_to_stub[wrapper_addr] = stub_addr
+
+    process_controller.set_memory_protection(cave_addr, stub_bytes_len, "rwx")
+    process_controller.write_process_memory(cave_addr, list(blob))
+
+    ptr_fmt = pointer_size_to_fmt(ptr_size)
+    rewritten = 0
+    for mem_range in process_controller.main_module_ranges:
+        if cave_addr <= mem_range.base < cave_addr + stub_bytes_len:
+            continue
+        try:
+            raw = process_controller.read_process_memory(mem_range.base,
+                                                         mem_range.size)
+        except ReadProcessMemoryError:
+            continue
+        limit = len(raw) - ptr_size + 1
+        for offset in range(0, limit, ptr_size):
+            value = struct.unpack_from(ptr_fmt, raw, offset)[0]
+            stub_addr = value_to_stub.get(value)
+            if stub_addr is None or stub_addr == value:
+                continue
+            slot_addr = mem_range.base + offset
+            if iat_addr <= slot_addr < iat_addr + len(api_to_calls) * ptr_size:
+                continue
+            _write_pointer(process_controller, slot_addr, stub_addr, ptr_fmt)
+            rewritten += 1
+
+    LOG.info("Redirected stored import pointers: %d", rewritten)
+
+
+def _import_stub_cave(process_controller: ProcessController, image_base: int,
+                      oep: int, pe_file_path: str,
+                      size: int) -> Optional[int]:
+    with open(pe_file_path, "rb") as pe_file:
+        pe_file.seek(0x3C)
+        e_lfanew = struct.unpack("<I", pe_file.read(4))[0]
+        pe_file.seek(e_lfanew + 24 + 16)
+        ep_rva = struct.unpack("<I", pe_file.read(4))[0]
+
+    entry_va = image_base + ep_rva
+    if entry_va == oep:
+        return None
+
+    for mem_range in process_controller.main_module_ranges:
+        if mem_range.contains(entry_va) and mem_range.size >= size:
+            return mem_range.base
+    return None
+
+
+def _write_pointer(process_controller: ProcessController, addr: int,
+                   value: int, ptr_fmt: str) -> None:
+    data = list(struct.pack(ptr_fmt, value))
+    try:
+        process_controller.write_process_memory(addr, data)
+    except WriteProcessMemoryError:
+        process_controller.set_memory_protection(addr,
+                                                 process_controller.page_size,
+                                                 "rwx")
+        process_controller.write_process_memory(addr, data)
 
 
 def _generate_new_iat_in_process(
