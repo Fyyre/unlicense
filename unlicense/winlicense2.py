@@ -348,11 +348,12 @@ def _redirect_stored_import_pointers(
     arch = process_controller.architecture
     stub_stride = 8
     stub_bytes_len = len(api_to_calls) * stub_stride
-    cave_addr = _import_stub_cave(process_controller, image_base, oep,
-                                  pe_file_path, stub_bytes_len)
+    cave_addr = _claim_import_stub_cave(process_controller, image_base, oep,
+                                        pe_file_path, stub_bytes_len)
     if cave_addr is None or stub_bytes_len == 0:
         LOG.info("No cave for import stubs, leaving stored pointers")
         return
+    LOG.info("Import stub cave at %s", hex(cave_addr))
 
     value_to_stub: Dict[int, int] = {}
     blob = bytearray()
@@ -368,14 +369,16 @@ def _redirect_stored_import_pointers(
         else:
             raise NotImplementedError(f"Unsupported architecture: {arch}")
         blob += insn + b"\x90" * (stub_stride - len(insn))
+    try:
+        process_controller.write_process_memory(cave_addr, list(blob))
+    except WriteProcessMemoryError:
+        LOG.info("Failed to write import stubs, leaving stored pointers")
+        return
 
     for wrapper_addr, api_addr in wrapper_to_api.items():
         stub_addr = value_to_stub.get(api_addr)
         if stub_addr is not None:
             value_to_stub[wrapper_addr] = stub_addr
-
-    process_controller.set_memory_protection(cave_addr, stub_bytes_len, "rwx")
-    process_controller.write_process_memory(cave_addr, list(blob))
 
     ptr_fmt = pointer_size_to_fmt(ptr_size)
     rewritten = 0
@@ -402,23 +405,59 @@ def _redirect_stored_import_pointers(
     LOG.info("Redirected stored import pointers: %d", rewritten)
 
 
-def _import_stub_cave(process_controller: ProcessController, image_base: int,
-                      oep: int, pe_file_path: str,
-                      size: int) -> Optional[int]:
+def _claim_import_stub_cave(process_controller: ProcessController,
+                            image_base: int, oep: int, pe_file_path: str,
+                            size: int) -> Optional[int]:
+    """
+    Themida's entry section is a usable cave, but after unpacking it may be
+    unreadable or split into ranges smaller than the stub block. Take the
+    cave from the on-disk section table and make it writable.
+    """
+    if size <= 0:
+        return None
+
+    for candidate in _import_stub_caves(image_base, oep, pe_file_path, size):
+        try:
+            if process_controller.set_memory_protection(candidate, size,
+                                                        "rwx"):
+                return candidate
+        except Exception as ex:
+            LOG.debug("Import stub cave %s rejected: %s", hex(candidate), ex)
+    return None
+
+
+def _import_stub_caves(image_base: int, oep: int, pe_file_path: str,
+                       size: int) -> List[int]:
     with open(pe_file_path, "rb") as pe_file:
         pe_file.seek(0x3C)
         e_lfanew = struct.unpack("<I", pe_file.read(4))[0]
+        pe_file.seek(e_lfanew + 6)
+        number_of_sections = struct.unpack("<H", pe_file.read(2))[0]
+        pe_file.seek(e_lfanew + 20)
+        size_of_optional = struct.unpack("<H", pe_file.read(2))[0]
         pe_file.seek(e_lfanew + 24 + 16)
         ep_rva = struct.unpack("<I", pe_file.read(4))[0]
+        pe_file.seek(e_lfanew + 24 + size_of_optional)
+        sections = []
+        for _ in range(number_of_sections):
+            header = pe_file.read(40)
+            virtual_size, virtual_addr = struct.unpack_from("<II", header, 8)
+            characteristics = struct.unpack_from("<I", header, 36)[0]
+            sections.append((virtual_addr, virtual_size, characteristics))
 
-    entry_va = image_base + ep_rva
-    if entry_va == oep:
-        return None
+    oep_rva = oep - image_base
+    ranked = []
+    for virtual_addr, virtual_size, characteristics in sections:
+        if virtual_size < size:
+            continue
+        if virtual_addr <= oep_rva < virtual_addr + virtual_size:
+            continue
+        holds_entry = virtual_addr <= ep_rva < virtual_addr + virtual_size
+        executable = (characteristics & 0x20000000) != 0
+        ranked.append((holds_entry, executable, virtual_addr))
 
-    for mem_range in process_controller.main_module_ranges:
-        if mem_range.contains(entry_va) and mem_range.size >= size:
-            return mem_range.base
-    return None
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [image_base + virtual_addr for _, _, virtual_addr in ranked]
 
 
 def _write_pointer(process_controller: ProcessController, addr: int,
