@@ -1,5 +1,6 @@
 import functools
 import logging
+import struct
 from importlib import resources
 from pathlib import Path
 from typing import (List, Callable, Dict, Any, Optional)
@@ -147,6 +148,94 @@ class FridaProcessController(ProcessController):
                            data=data)
 
 
+def _command_line_quotes(argument: str) -> bool:
+    """Frida quotes an argv element that contains one of these."""
+    return any(ch in argument for ch in (" ", "\t", "\n", "\v", "\""))
+
+
+def _rundll32_entry(pe_path: Path) -> str:
+    """
+    First export rundll32 can call. Ordinal 0 is skipped: it is a NULL
+    name to GetProcAddress, and rundll32 reports a missing entry.
+    """
+    ordinal = _first_export_ordinal(pe_path)
+    if ordinal is None:
+        return "#1"
+    return "#" + str(ordinal)
+
+
+def _first_export_ordinal(pe_path: Path) -> Optional[int]:
+    with pe_path.open("rb") as pe_file:
+        pe_file.seek(0x3C)
+        e_lfanew_raw = pe_file.read(4)
+        if len(e_lfanew_raw) != 4:
+            return None
+        e_lfanew = struct.unpack("<I", e_lfanew_raw)[0]
+        pe_file.seek(e_lfanew + 6)
+        number_of_sections = struct.unpack("<H", pe_file.read(2))[0]
+        pe_file.seek(e_lfanew + 20)
+        size_of_optional = struct.unpack("<H", pe_file.read(2))[0]
+        pe_file.seek(e_lfanew + 24)
+        magic = struct.unpack("<H", pe_file.read(2))[0]
+        if magic == 0x10B:
+            data_directory = e_lfanew + 24 + 96
+        elif magic == 0x20B:
+            data_directory = e_lfanew + 24 + 112
+        else:
+            return None
+
+        pe_file.seek(data_directory)
+        export_rva, export_size = struct.unpack("<II", pe_file.read(8))
+        if export_rva == 0 or export_size == 0:
+            return None
+
+        pe_file.seek(e_lfanew + 24 + size_of_optional)
+        sections = []
+        for _ in range(number_of_sections):
+            header = pe_file.read(40)
+            if len(header) != 40:
+                return None
+            virtual_size, virtual_addr, raw_size, raw_ptr = struct.unpack_from(
+                "<IIII", header, 8)
+            sections.append((virtual_addr, max(virtual_size, raw_size),
+                             raw_ptr, raw_size))
+
+        def rva_to_offset(rva: int) -> Optional[int]:
+            for virtual_addr, span, raw_ptr, raw_size in sections:
+                if virtual_addr <= rva < virtual_addr + span:
+                    delta = rva - virtual_addr
+                    if delta >= raw_size:
+                        return None
+                    return raw_ptr + delta
+            return None
+
+        export_offset = rva_to_offset(export_rva)
+        if export_offset is None:
+            return None
+        pe_file.seek(export_offset + 16)
+        ordinal_base, number_of_functions = struct.unpack("<II",
+                                                          pe_file.read(8))
+        pe_file.seek(export_offset + 28)
+        functions_rva = struct.unpack("<I", pe_file.read(4))[0]
+        functions_offset = rva_to_offset(functions_rva)
+        if functions_offset is None or number_of_functions == 0:
+            return None
+
+        pe_file.seek(functions_offset)
+        for index in range(number_of_functions):
+            function_raw = pe_file.read(4)
+            if len(function_raw) != 4:
+                return None
+            function_rva = struct.unpack("<I", function_raw)[0]
+            if function_rva == 0:
+                continue
+            ordinal = ordinal_base + index
+            if ordinal == 0:
+                continue
+            return ordinal
+    return None
+
+
 def _str_to_architecture(frida_arch: str) -> Architecture:
     if frida_arch == "ia32":
         return Architecture.X86_32
@@ -160,11 +249,19 @@ def spawn_and_instrument(
         notify_oep_reached: OepReachedCallback) -> ProcessController:
     pid: int
     if pe_path.suffix == ".dll":
-        # Use `rundll32` to load the DLL
+        # rundll32 takes one "dll,entry" argument. "#0" is not an export:
+        # the ordinal base is 1, and ordinal 0 is a NULL GetProcAddress name,
+        # so rundll32 reported "Missing entry: #0" and returned.
+        # A path Frida would quote is passed on its own so the entry stays
+        # outside the quotes.
         rundll32_path = "C:\\Windows\\System32\\rundll32.exe"
-        pid = frida.spawn(
-            rundll32_path,
-            [rundll32_path, str(pe_path.absolute()), "#0"])
+        dll_path = str(pe_path.absolute())
+        entry = _rundll32_entry(pe_path)
+        if _command_line_quotes(dll_path):
+            argv = [rundll32_path, dll_path, entry]
+        else:
+            argv = [rundll32_path, dll_path + "," + entry]
+        pid = frida.spawn(rundll32_path, argv)
     else:
         pid = frida.spawn(str(pe_path))
 

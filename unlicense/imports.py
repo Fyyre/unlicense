@@ -67,12 +67,10 @@ def find_wrapped_imports(
         # Ensure the instructions are "call/jmp" or "nop; call/jmp"
         instruction = next(instrs)
         if instruction.mnemonic in ["call", "jmp"]:
-            call_size = instruction.size
             op = instruction.operands[0]
         elif instruction.mnemonic == "nop":
             instruction = next(instrs)
             if instruction.mnemonic in ["call", "jmp"]:
-                call_size = instruction.size
                 op = instruction.operands[0]
             else:
                 i += 1
@@ -80,6 +78,11 @@ def find_wrapped_imports(
         else:
             i += 1
             continue
+
+        # The leading nop is not part of the site. The byte after a 5-byte
+        # call or jmp belongs to the next instruction.
+        site_addr = instruction.address
+        call_size = instruction.size
 
         # Parse destination address or ignore in case of error
         if op.type == X86_OP_IMM:
@@ -112,12 +115,12 @@ def find_wrapped_imports(
             # Not wrapped, add it to list of "resolved wrappers"
             if call_dest in exports_dict:
                 api_to_calls[call_dest].append(
-                    (instr_addr, call_size, instr_was_jmp))
+                    (site_addr, call_size, instr_was_jmp))
                 i += call_size + 1
                 continue
             # Wrapped, add it to set of wrappers to resolve
             if _is_in_executable_range(call_dest, process_controller):
-                wrapper_set.add((instr_addr, call_size, instr_was_jmp,
+                wrapper_set.add((site_addr, call_size, instr_was_jmp,
                                  call_dest, ptr_addr))
                 i += call_size + 1
                 continue

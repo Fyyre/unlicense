@@ -116,11 +116,16 @@ function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) 
                 notifyOepFound(dumpedModule, oepCandidate);
             }
 
-            // If the access violation is not an execution, "allow" the operation.
-            // Note: Pages will be reprotected on the next call to
-            // `NtProtectVirtualMemory`.
+            // Data accesses are let through. The fault address is not page
+            // aligned, so a one-page region starting there also covers the
+            // next page. That protect fails when the next page is not
+            // committed, and treating the fault as handled retries forever.
             if (exp.memory.operation != "execute") {
-                Memory.protect(exp.memory.address, Process.pageSize, "rw-");
+                const pageSize = Process.pageSize;
+                const pageBase = exp.memory.address.and(ptr(pageSize - 1).not());
+                if (!Memory.protect(pageBase, pageSize, "rw-")) {
+                    return false;
+                }
                 return true;
             }
         }

@@ -1,6 +1,6 @@
 import logging
 import struct
-from typing import Callable, Dict, Tuple, Any, Optional
+from typing import Callable, Dict, List, Tuple, Any, Optional
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_PROT_READ,
@@ -14,6 +14,8 @@ from .dump_utils import pointer_size_to_fmt
 from .process_control import ProcessController, Architecture, ReadProcessMemoryError
 
 STACK_MAGIC_RET_ADDR = 0xdeadbeef
+# Wrappers that never reach an export must not run forever. count=0 does.
+_MAX_WRAPPER_INSTRUCTIONS = 1000000
 LOG = logging.getLogger(__name__)
 
 
@@ -28,7 +30,6 @@ def resolve_wrapped_api(
         pc_register = UC_X86_REG_EIP
         sp_register = UC_X86_REG_ESP
         bp_register = UC_X86_REG_EBP
-        result_register = UC_X86_REG_EAX
         stack_addr = 0xff000000
         setup_teb = _setup_teb_x86
     elif arch == Architecture.X86_64:
@@ -37,7 +38,6 @@ def resolve_wrapped_api(
         pc_register = UC_X86_REG_RIP
         sp_register = UC_X86_REG_RSP
         bp_register = UC_X86_REG_RBP
-        result_register = UC_X86_REG_RAX
         stack_addr = 0xff00000000000000
         setup_teb = _setup_teb_x64
     else:
@@ -69,20 +69,22 @@ def resolve_wrapped_api(
             stop_on_ret_addr = STACK_MAGIC_RET_ADDR
         else:
             stop_on_ret_addr = expected_ret_addr
+        resolved_api: List[Optional[int]] = [None]
         uc.hook_add(UC_HOOK_MEM_UNMAPPED,
                     _unicorn_hook_unmapped,
                     user_data=process_controller)
         uc.hook_add(UC_HOOK_BLOCK,
                     _unicorn_hook_block,
-                    user_data=(process_controller, stop_on_ret_addr))
+                    user_data=(process_controller, stop_on_ret_addr,
+                               resolved_api))
 
-        uc.emu_start(wrapper_start_addr, wrapper_start_addr + 1024)
+        uc.emu_start(wrapper_start_addr,
+                     wrapper_start_addr + 1024,
+                     count=_MAX_WRAPPER_INSTRUCTIONS)
 
-        # Read and return PC
-        pc = uc.reg_read(result_register)
-        assert isinstance(pc, int)
-
-        return pc
+        # Only an export the block hook accepted is a result. EAX is
+        # whatever the wrapper left behind when emulation stops early.
+        return resolved_api[0]
     except UcError as e:
         LOG.debug("ERROR: %s", str(e))
         pc = uc.reg_read(pc_register)
@@ -155,9 +157,11 @@ def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
         return False
 
 
-def _unicorn_hook_block(uc: Uc, address: int, _size: int,
-                        user_data: Tuple[ProcessController, int]) -> None:
-    process_controller, stop_on_ret_addr = user_data
+def _unicorn_hook_block(
+        uc: Uc, address: int, _size: int,
+        user_data: Tuple[ProcessController, int, List[Optional[int]]]
+) -> None:
+    process_controller, stop_on_ret_addr, resolved_api = user_data
     ptr_size = process_controller.pointer_size
     arch = process_controller.architecture
     if arch == Architecture.X86_32:
@@ -186,12 +190,14 @@ def _unicorn_hook_block(uc: Uc, address: int, _size: int,
                 or ret_addr == STACK_MAGIC_RET_ADDR:
             # Most wrappers should end up here directly
             uc.reg_write(result_register, address)
+            resolved_api[0] = address
             uc.emu_stop()
             return
         if _is_no_return_api(api_name):
             # Note: Dirty fix for ExitProcess-like wrappers on WinLicense 3.x
             LOG.debug("Reached noreturn API, stopping emulation")
             uc.reg_write(result_register, address)
+            resolved_api[0] = address
             uc.emu_stop()
             return
         if _is_bogus_api(api_name):

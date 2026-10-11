@@ -1,7 +1,7 @@
 import logging
 import struct
 from bisect import bisect_right
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 from capstone import (  # type: ignore
     Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64)
@@ -75,13 +75,14 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     # Ensure the range is writable
     process_controller.set_memory_protection(text_section_range.base,
                                              text_section_range.size, "rwx")
+    api_to_stub = _write_import_stubs(api_to_calls, iat_addr, image_base, oep,
+                                      pe_file_path, process_controller)
     # Replace detected references to wrappers or imports
     LOG.info("Patching call and jmp sites ...")
-    _fix_import_references_in_process(api_to_calls, iat_addr,
+    _fix_import_references_in_process(api_to_calls, iat_addr, api_to_stub,
                                       process_controller)
     _redirect_stored_import_pointers(api_to_calls, wrapper_to_api, iat_addr,
-                                     image_base, oep, pe_file_path,
-                                     process_controller)
+                                     api_to_stub, process_controller)
     # Restore memory protection to RX
     process_controller.set_memory_protection(text_section_range.base,
                                              text_section_range.size, "r-x")
@@ -98,7 +99,8 @@ def _generate_export_hashes(
     Go through the given export dictionary and produce a hash for each function
     listed in it.
     """
-    result = {}
+    result: Dict[int, int] = {}
+    collisions: Set[int] = set()
     modules = process_controller.enumerate_modules()
     LOG.debug("Hashing exports for %s", str(modules))
     ranges = []
@@ -122,11 +124,24 @@ def _generate_export_hashes(
     for i, (export_addr, _) in enumerate(exports_dict.items()):
         export_hash = compute_function_hash(md, export_addr, get_data,
                                             process_controller)
-        if export_hash != EMPTY_FUNCTION_HASH:
-            result[export_hash] = export_addr
-        else:
+        if export_hash == EMPTY_FUNCTION_HASH:
             LOG.debug("Empty hash for %s", hex(export_addr))
+        else:
+            previous = result.get(export_hash)
+            if previous is None:
+                result[export_hash] = export_addr
+            elif previous != export_addr:
+                # Two exports hashed the same. Keeping either one resolves
+                # every matching wrapper to the wrong API.
+                collisions.add(export_hash)
+                LOG.debug("Export hash collision %s: %s and %s",
+                          hex(export_hash), hex(previous), hex(export_addr))
         LOG.debug("Exports hashed: %d/%d", i, exports_count)
+
+    for export_hash in collisions:
+        del result[export_hash]
+    if collisions:
+        LOG.info("Ignored %d ambiguous export hashes", len(collisions))
 
     return result
 
@@ -154,6 +169,7 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
     # Iterate over the set of potential import wrappers and try to resolve them
     resolved_wrappers: Dict[int, int] = {}
     problematic_wrappers = set()
+    exports_dict = process_controller.enumerate_exported_functions()
     for call_addr, call_size, instr_was_jmp, wrapper_addr, _ in wrapper_set:
         resolved_addr = resolved_wrappers.get(wrapper_addr)
         if resolved_addr is not None:
@@ -193,13 +209,16 @@ def _resolve_imports(api_to_calls: ImportToCallSiteDict,
         # Try to resolve the destination address by emulating the wrapper
         resolved_addr = resolve_wrapped_api(call_addr, process_controller,
                                             call_addr + call_size)
-        if resolved_addr is not None:
+        if resolved_addr in exports_dict:
             LOG.debug("Resolved API: %s -> %s", hex(wrapper_addr),
                       hex(resolved_addr))
             resolved_wrappers[wrapper_addr] = resolved_addr
             api_to_calls[resolved_addr].append(
                 (call_addr, call_size, instr_was_jmp))
         else:
+            if resolved_addr is not None:
+                LOG.debug("Rejected emulation result %s for wrapper %s",
+                          hex(resolved_addr), hex(wrapper_addr))
             problematic_wrappers.add(wrapper_addr)
 
     return resolved_wrappers
@@ -335,14 +354,13 @@ def _resolve_stub_pointer(
     return None
 
 
-def _redirect_stored_import_pointers(
-        api_to_calls: ImportToCallSiteDict, wrapper_to_api: Dict[int, int],
-        iat_addr: int, image_base: int, oep: int, pe_file_path: str,
-        process_controller: ProcessController) -> None:
+def _write_import_stubs(
+        api_to_calls: ImportToCallSiteDict, iat_addr: int, image_base: int,
+        oep: int, pe_file_path: str,
+        process_controller: ProcessController) -> Dict[int, int]:
     """
-    Point stored wrapper/API addresses at in-image jump stubs. The stubs go
-    through the IAT, so the dump does not depend on Themida's private
-    allocation or on the system DLLs' load addresses.
+    Write one `jmp [iat]` stub per API. Five-byte call sites branch here,
+    and stored pointers are rewritten to these addresses.
     """
     ptr_size = process_controller.pointer_size
     arch = process_controller.architecture
@@ -351,16 +369,14 @@ def _redirect_stored_import_pointers(
     cave_addr = _claim_import_stub_cave(process_controller, image_base, oep,
                                         pe_file_path, stub_bytes_len)
     if cave_addr is None or stub_bytes_len == 0:
-        LOG.info("No cave for import stubs, leaving stored pointers")
-        return
-    LOG.info("Import stub cave at %s", hex(cave_addr))
+        return {}
 
-    value_to_stub: Dict[int, int] = {}
+    api_to_stub: Dict[int, int] = {}
     blob = bytearray()
     for index, api_addr in enumerate(api_to_calls):
         stub_addr = cave_addr + index * stub_stride
         iat_slot = iat_addr + index * ptr_size
-        value_to_stub[api_addr] = stub_addr
+        api_to_stub[api_addr] = stub_addr
         if arch == Architecture.X86_32:
             insn = bytes([0xFF, 0x25]) + struct.pack("<I", iat_slot)
         elif arch == Architecture.X86_64:
@@ -372,9 +388,31 @@ def _redirect_stored_import_pointers(
     try:
         process_controller.write_process_memory(cave_addr, list(blob))
     except WriteProcessMemoryError:
-        LOG.info("Failed to write import stubs, leaving stored pointers")
+        LOG.info("Failed to write import stubs")
+        return {}
+
+    LOG.info("Import stub cave at %s", hex(cave_addr))
+    return api_to_stub
+
+
+def _redirect_stored_import_pointers(
+        api_to_calls: ImportToCallSiteDict, wrapper_to_api: Dict[int, int],
+        iat_addr: int, api_to_stub: Dict[int, int],
+        process_controller: ProcessController) -> None:
+    """
+    Point stored wrapper/API addresses at in-image jump stubs. The stubs go
+    through the IAT, so the dump does not depend on Themida's private
+    allocation or on the system DLLs' load addresses.
+    """
+    if not api_to_stub:
+        LOG.info("No cave for import stubs, leaving stored pointers")
         return
 
+    ptr_size = process_controller.pointer_size
+    stub_stride = 8
+    cave_addr = min(api_to_stub.values())
+    stub_bytes_len = len(api_to_calls) * stub_stride
+    value_to_stub = dict(api_to_stub)
     for wrapper_addr, api_addr in wrapper_to_api.items():
         stub_addr = value_to_stub.get(api_addr)
         if stub_addr is not None:
@@ -497,8 +535,43 @@ def _generate_new_iat_in_process(
     return iat_addr, iat_size
 
 
+def _encode_import_site(call_addr: int, call_size: int, instr_was_jmp: bool,
+                        iat_slot: int, stub_addr: Optional[int],
+                        arch: Architecture) -> Optional[bytes]:
+    """
+    Encode a call or jmp that fits in `call_size` bytes. `call/jmp [imm32]`
+    is 6 bytes, so a 5-byte site branches to the API's `jmp [iat]` stub
+    instead of overwriting the next instruction.
+    """
+    if arch == Architecture.X86_32:
+        operand = iat_slot
+        fmt = "<I"
+    elif arch == Architecture.X86_64:
+        operand = iat_slot - (call_addr + 6)
+        fmt = "<i"
+    else:
+        raise NotImplementedError(f"Unsupported architecture: {arch}")
+
+    if instr_was_jmp:
+        indirect = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
+    else:
+        indirect = bytes([0xFF, 0x15]) + struct.pack(fmt, operand)
+
+    if call_size >= len(indirect):
+        return indirect + b"\x90" * (call_size - len(indirect))
+    if call_size != 5 or stub_addr is None:
+        return None
+
+    displacement = stub_addr - (call_addr + 5)
+    if displacement < -0x80000000 or displacement > 0x7FFFFFFF:
+        return None
+    opcode = 0xE9 if instr_was_jmp else 0xE8
+    return bytes([opcode]) + struct.pack("<i", displacement)
+
+
 def _fix_import_references_in_process(
         api_to_calls: ImportToCallSiteDict, iat_addr: int,
+        api_to_stub: Dict[int, int],
         process_controller: ProcessController) -> None:
     """
     Replace resolved wrapper call sites with call/jmp to the new IAT (that
@@ -506,24 +579,21 @@ def _fix_import_references_in_process(
     """
     arch = process_controller.architecture
     ptr_size = process_controller.pointer_size
+    skipped = 0
 
-    for i, call_addrs in enumerate(api_to_calls.values()):
-        for call_addr, _, instr_was_jmp in call_addrs:
-            if arch == Architecture.X86_32:
-                # Absolute
-                operand = iat_addr + i * ptr_size
-                fmt = "<I"
-            elif arch == Architecture.X86_64:
-                # RIP-relative
-                operand = iat_addr + i * ptr_size - (call_addr + 6)
-                fmt = "<i"
-            else:
-                raise NotImplementedError(f"Unsupported architecture: {arch}")
+    for i, (api_addr, call_addrs) in enumerate(api_to_calls.items()):
+        iat_slot = iat_addr + i * ptr_size
+        stub_addr = api_to_stub.get(api_addr)
+        for call_addr, call_size, instr_was_jmp in call_addrs:
+            patch = _encode_import_site(call_addr, call_size, instr_was_jmp,
+                                        iat_slot, stub_addr, arch)
+            if patch is None:
+                skipped += 1
+                LOG.debug("Leaving call site %s unchanged (size %d)",
+                          hex(call_addr), call_size)
+                continue
+            process_controller.write_process_memory(call_addr, list(patch))
 
-            if instr_was_jmp:
-                # jmp [iat_addr + i * ptr_size]
-                new_instr = bytes([0xFF, 0x25]) + struct.pack(fmt, operand)
-            else:
-                # call [iat_addr + i * ptr_size]
-                new_instr = bytes([0xFF, 0x15]) + struct.pack(fmt, operand)
-            process_controller.write_process_memory(call_addr, list(new_instr))
+    if skipped:
+        LOG.info("Left %d call sites unchanged to avoid corrupting neighbours",
+                 skipped)
