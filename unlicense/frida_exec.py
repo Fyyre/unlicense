@@ -1,9 +1,12 @@
+import ctypes
 import functools
 import logging
 import struct
+import threading
+from ctypes import wintypes
 from importlib import resources
 from pathlib import Path
-from typing import (List, Callable, Dict, Any, Optional)
+from typing import (List, Callable, Dict, Any, Optional, Tuple)
 
 import frida
 import frida.core
@@ -35,6 +38,7 @@ class FridaProcessController(ProcessController):
         # Initialize FridaProcessController specifics
         self._frida_rpc = frida_rpc
         self._frida_session = frida_session
+        self.process_exited = threading.Event()
         self._exported_functions_cache: Optional[Dict[int, Dict[str,
                                                                 Any]]] = None
 
@@ -131,9 +135,16 @@ class FridaProcessController(ProcessController):
             raise WriteProcessMemoryError from rpc_exception
 
     def terminate_process(self) -> None:
-        self._frida_rpc.notify_dumping_finished()
-        frida.kill(self.pid)
-        self._frida_session.detach()
+        # notify_dumping_finished takes the agent lock. A fault handler that
+        # is still on that lock never returns, so kill would not run.
+        try:
+            frida.kill(self.pid)
+        except (frida.ProcessNotFoundError, frida.InvalidOperationError):
+            pass
+        try:
+            self._frida_session.detach()
+        except (frida.InvalidOperationError, frida.ProcessNotFoundError):
+            pass
 
     def _frida_range_to_mem_range(self, dict_range: Dict[str, Any],
                                   with_data: bool) -> MemoryRange:
@@ -244,10 +255,86 @@ def _str_to_architecture(frida_arch: str) -> Architecture:
     raise ValueError
 
 
+_CREATE_SUSPENDED = 0x00000004
+
+
+class _STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+
+class _PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+def _spawn_exe_suspended(pe_path: Path) -> Tuple[int, int, int]:
+    # frida.spawn debugs the new process. WinLicense treats that debug port
+    # as a debugger and blocks on "A debugger has been found".
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    startup = _STARTUPINFOW()
+    startup.cb = ctypes.sizeof(startup)
+    created = _PROCESS_INFORMATION()
+    if not kernel32.CreateProcessW(
+            str(pe_path), None, None, None, False, _CREATE_SUSPENDED, None,
+            str(pe_path.parent), ctypes.byref(startup), ctypes.byref(created)):
+        raise OSError(ctypes.get_last_error(), "CreateProcessW failed")
+    return int(created.dwProcessId), int(created.hThread), int(created.hProcess)
+
+
+def _kernel32() -> ctypes.WinDLL:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _resume_suspended(thread: int, process: int) -> None:
+    kernel32 = _kernel32()
+    kernel32.ResumeThread(wintypes.HANDLE(thread))
+    kernel32.CloseHandle(wintypes.HANDLE(thread))
+    kernel32.CloseHandle(wintypes.HANDLE(process))
+
+
+def _terminate_suspended(thread: int, process: int) -> None:
+    kernel32 = _kernel32()
+    kernel32.TerminateProcess(wintypes.HANDLE(process), 1)
+    kernel32.CloseHandle(wintypes.HANDLE(thread))
+    kernel32.CloseHandle(wintypes.HANDLE(process))
+
+
 def spawn_and_instrument(
         pe_path: Path, text_section_ranges: List[MemoryRange],
         notify_oep_reached: OepReachedCallback) -> ProcessController:
     pid: int
+    suspended_thread = 0
+    suspended_process = 0
     if pe_path.suffix == ".dll":
         # rundll32 takes one "dll,entry" argument. "#0" is not an export:
         # the ordinal base is 1, and ordinal 0 is a NULL GetProcAddress name,
@@ -263,23 +350,39 @@ def spawn_and_instrument(
             argv = [rundll32_path, dll_path + "," + entry]
         pid = frida.spawn(rundll32_path, argv)
     else:
-        pid = frida.spawn(str(pe_path))
+        pid, suspended_thread, suspended_process = _spawn_exe_suspended(pe_path)
 
-    main_module_name = pe_path.name
-    session = frida.attach(pid)
-    frida_js = resources.open_text("unlicense.resources", "frida.js").read()
-    script = session.create_script(frida_js)
-    on_message_callback = functools.partial(_frida_callback,
-                                            notify_oep_reached)
-    script.on('message', on_message_callback)
-    script.load()
+    try:
+        main_module_name = pe_path.name
+        session = frida.attach(pid)
+        frida_js = resources.open_text("unlicense.resources", "frida.js").read()
+        script = session.create_script(frida_js)
+        on_message_callback = functools.partial(_frida_callback,
+                                                notify_oep_reached)
+        script.on('message', on_message_callback)
+        script.load()
 
-    frida_rpc = script.exports
-    process_controller = FridaProcessController(pid, main_module_name, session,
-                                                script)
-    frida_rpc.setup_oep_tracing(pe_path.name, [[r.base, r.size]
-                                               for r in text_section_ranges])
-    frida.resume(pid)
+        frida_rpc = script.exports
+        process_controller = FridaProcessController(pid, main_module_name,
+                                                    session, script)
+
+        def _on_detached(reason: str, _crash: Any) -> None:
+            if reason == "process-terminated":
+                process_controller.process_exited.set()
+
+        session.on("detached", _on_detached)
+        frida_rpc.setup_oep_tracing(pe_path.name, [[r.base, r.size]
+                                                   for r in text_section_ranges])
+        if suspended_thread == 0:
+            frida.resume(pid)
+        else:
+            _resume_suspended(suspended_thread, suspended_process)
+            suspended_thread = 0
+            suspended_process = 0
+    except Exception:
+        if suspended_process != 0:
+            _terminate_suspended(suspended_thread, suspended_process)
+        raise
 
     return process_controller
 

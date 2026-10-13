@@ -4,11 +4,12 @@ from typing import Callable, Dict, List, Tuple, Any, Optional
 
 from unicorn import (  # type: ignore
     Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_PROT_READ,
-    UC_PROT_WRITE, UC_PROT_ALL, UC_HOOK_MEM_UNMAPPED, UC_HOOK_BLOCK)
+    UC_PROT_WRITE, UC_PROT_ALL, UC_HOOK_MEM_UNMAPPED, UC_HOOK_BLOCK,
+    UC_HOOK_CODE)
 from unicorn.x86_const import (  # type: ignore
     UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EIP, UC_X86_REG_RSP,
     UC_X86_REG_RBP, UC_X86_REG_RIP, UC_X86_REG_MSR, UC_X86_REG_EAX,
-    UC_X86_REG_RAX)
+    UC_X86_REG_RAX, UC_X86_REG_RBX)
 
 from .dump_utils import pointer_size_to_fmt
 from .process_control import ProcessController, Architecture, ReadProcessMemoryError
@@ -70,6 +71,7 @@ def resolve_wrapped_api(
         else:
             stop_on_ret_addr = expected_ret_addr
         resolved_api: List[Optional[int]] = [None]
+        captured_api: List[Optional[int]] = [None]
         uc.hook_add(UC_HOOK_MEM_UNMAPPED,
                     _unicorn_hook_unmapped,
                     user_data=process_controller)
@@ -77,14 +79,41 @@ def resolve_wrapped_api(
                     _unicorn_hook_block,
                     user_data=(process_controller, stop_on_ret_addr,
                                resolved_api))
+        uc.hook_add(UC_HOOK_CODE, _unicorn_hook_code,
+                    user_data=(process_controller, captured_api))
 
-        uc.emu_start(wrapper_start_addr,
-                     wrapper_start_addr + 1024,
-                     count=_MAX_WRAPPER_INSTRUCTIONS)
+        # +1024 cuts off wrappers before they rebuild the API address.
+        # Stop at the end of the containing range, and keep the instruction
+        # cap so a wrapper that never returns cannot run forever.
+        until_addr = wrapper_start_addr + 1024
+        code_range = process_controller.find_range_by_address(
+            wrapper_start_addr)
+        if code_range is not None:
+            range_end = code_range.base + code_range.size
+            if range_end > wrapper_start_addr:
+                until_addr = range_end
 
-        # Only an export the block hook accepted is a result. EAX is
-        # whatever the wrapper left behind when emulation stops early.
-        return resolved_api[0]
+        try:
+            uc.emu_start(wrapper_start_addr, until_addr,
+                         count=_MAX_WRAPPER_INSTRUCTIONS)
+        except UcError as e:
+            LOG.debug("ERROR: %s", str(e))
+            if resolved_api[0] is None and captured_api[0] is None:
+                pc = uc.reg_read(pc_register)
+                assert isinstance(pc, int)
+                sp = uc.reg_read(sp_register)
+                assert isinstance(sp, int)
+                bp = uc.reg_read(bp_register)
+                assert isinstance(bp, int)
+                LOG.debug("PC=%s", hex(pc))
+                LOG.debug("SP=%s", hex(sp))
+                LOG.debug("BP=%s", hex(bp))
+                return None
+
+        # Block hook export wins. Otherwise use the or rax, rbx address.
+        if resolved_api[0] is not None:
+            return resolved_api[0]
+        return captured_api[0]
     except UcError as e:
         LOG.debug("ERROR: %s", str(e))
         pc = uc.reg_read(pc_register)
@@ -155,6 +184,44 @@ def _unicorn_hook_unmapped(uc: Uc, _access: Any, address: int, _size: int,
     except Exception as e:
         LOG.error("ERROR: %s", str(e))
         return False
+
+
+def _unicorn_hook_code(
+        uc: Uc, address: int, _size: int,
+        user_data: Tuple[ProcessController, List[Optional[int]]]) -> None:
+    process_controller, captured_api = user_data
+    if process_controller.architecture != Architecture.X86_64:
+        return
+
+    try:
+        insn = bytes(uc.mem_read(address, 3))
+    except UcError:
+        return
+    # Themida 3.x rebuilds the API address with or rax, rbx.
+    if insn != b"\x48\x09\xd8":
+        return
+
+    rax = uc.reg_read(UC_X86_REG_RAX)
+    rbx = uc.reg_read(UC_X86_REG_RBX)
+    assert isinstance(rax, int)
+    assert isinstance(rbx, int)
+    candidate = rax | rbx
+    if candidate == 0:
+        return
+
+    try:
+        process_controller.read_process_memory(candidate, 1)
+        ranges = process_controller.enumerate_module_ranges(
+            process_controller.main_module_name)
+    except Exception:
+        return
+
+    for m_range in ranges:
+        if m_range.contains(candidate):
+            LOG.warning("%s (resolved) in module range", hex(candidate))
+            break
+
+    captured_api[0] = candidate
 
 
 def _unicorn_hook_block(

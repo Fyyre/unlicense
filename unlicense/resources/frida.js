@@ -89,6 +89,109 @@ function removeOepTracingHooks() {
     oepTracingListeners = [];
 }
 
+// Frida 17 removed Module.findExportByName and Process.enumerateRangesSync.
+function findExport(moduleName, exportName) {
+    if (typeof Module.findExportByName === "function") {
+        return Module.findExportByName(moduleName, exportName);
+    }
+
+    const mod = Process.findModuleByName(moduleName);
+    if (mod == null) {
+        return null;
+    }
+    return mod.findExportByName(exportName);
+}
+
+function enumerateReadableRanges() {
+    if (typeof Process.enumerateRangesSync === "function") {
+        return Process.enumerateRangesSync("r--");
+    }
+    return Process.enumerateRanges("r--");
+}
+
+function readByteArray(address, size) {
+    if (typeof Memory.readByteArray === "function") {
+        return Memory.readByteArray(address, size);
+    }
+    return address.readByteArray(size);
+}
+
+function writeByteArray(address, bytes) {
+    if (typeof Memory.writeByteArray === "function") {
+        return Memory.writeByteArray(address, bytes);
+    }
+    return address.writeByteArray(bytes);
+}
+
+function addressInOepRanges(dumpedModule, address, expectedOepRanges) {
+    for (let i = 0; i < expectedOepRanges.length; i++) {
+        const oepRange = expectedOepRanges[i];
+        const sectionRange = {
+            base: dumpedModule.base.add(oepRange[0]),
+            size: oepRange[1]
+        };
+        if (rangeContainsAddress(sectionRange, address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+let rtlLookupFunctionEntry = null;
+const rtlLookupImageBase = Memory.alloc(Process.pointerSize);
+
+function lookupFunctionStart(address) {
+    if (rtlLookupFunctionEntry == null) {
+        const lookup = findExport("ntdll", "RtlLookupFunctionEntry");
+        if (lookup == null) {
+            return null;
+        }
+        rtlLookupFunctionEntry = new NativeFunction(
+            lookup, "pointer", ["pointer", "pointer", "pointer"]);
+    }
+    const entry = rtlLookupFunctionEntry(address, rtlLookupImageBase, ptr(0));
+    if (entry.isNull()) {
+        return null;
+    }
+    return rtlLookupImageBase.readPointer().add(entry.readU32());
+}
+
+// The first fault with RIP inside the decrypted section is a callee. The
+// entry is the outermost function still on the stack.
+function resolveX64Oep(dumpedModule, pc, sp, expectedOepRanges) {
+    let chosen = pc;
+
+    for (let i = 0; i < 48; i++) {
+        let value;
+        try {
+            value = sp.add(i * 8).readPointer();
+        } catch (error) {
+            break;
+        }
+        if (!addressInOepRanges(dumpedModule, value, expectedOepRanges)) {
+            continue;
+        }
+        try {
+            if (value.sub(5).readU8() !== 0xE8) {
+                continue;
+            }
+        } catch (error) {
+            continue;
+        }
+        const start = lookupFunctionStart(value);
+        if (start != null && addressInOepRanges(dumpedModule, start, expectedOepRanges)) {
+            chosen = start;
+        }
+    }
+    if (chosen.equals(pc)) {
+        const start = lookupFunctionStart(pc);
+        if (start != null) {
+            chosen = start;
+        }
+    }
+    return chosen;
+}
+
 function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) {
     // Register an exception handler that'll detect the OEP
     Process.setExceptionHandler(exp => {
@@ -121,6 +224,18 @@ function registerExceptionHandler(dumpedModule, expectedOepRanges, moduleIsDll) 
             // next page. That protect fails when the next page is not
             // committed, and treating the fault as handled retries forever.
             if (exp.memory.operation != "execute") {
+                // x64 WinLicense consumes an execute fault on a no-access
+                // section before this handler runs. Leave that section
+                // executable. The first fault whose PC is inside it is a
+                // callee of the real entry.
+                if (Process.arch === "x64" && !moduleIsDll && !oepReached &&
+                    addressInOepRanges(dumpedModule, oepCandidate, expectedOepRanges)) {
+                    const oep = resolveX64Oep(
+                        dumpedModule, oepCandidate, exp.context.sp, expectedOepRanges);
+                    log(`OEP found (thread #${threadId}): ${oep}`);
+                    notifyOepFound(dumpedModule, oep);
+                    return true;
+                }
                 const pageSize = Process.pageSize;
                 const pageBase = exp.memory.address.and(ptr(pageSize - 1).not());
                 if (!Memory.protect(pageBase, pageSize, "rw-")) {
@@ -249,7 +364,7 @@ rpc.exports = {
 
         // Hook `ntdll.LdrLoadDll` on exit to get called at a point where the
         // loader lock is released. Needed to unpack (32-bit) DLLs.
-        const loadDll = Module.findExportByName('ntdll', 'LdrLoadDll');
+        const loadDll = findExport('ntdll', 'LdrLoadDll');
         const loadDllListener = Interceptor.attach(loadDll, {
             onLeave: function (_args) {
                 // If `dllOepCandidate` is set, proceed with the dumping
@@ -263,8 +378,15 @@ rpc.exports = {
         oepTracingListeners.push(loadDllListener);
 
         let exceptionHandlerRegistered = false;
-        const ntProtectVirtualMemory = Module.findExportByName('ntdll', 'NtProtectVirtualMemory');
-        if (ntProtectVirtualMemory != null) {
+        // x64 EXEs stay executable. Clearing execute makes WinLicense report
+        // the fault itself and never reach this handler. 32-bit targets keep
+        // the no-access trap below.
+        if (!targetIsDll && Process.arch === "x64" && dumpedModule != null) {
+            registerExceptionHandler(dumpedModule, expectedOepRanges, targetIsDll);
+            exceptionHandlerRegistered = true;
+        }
+        const ntProtectVirtualMemory = findExport('ntdll', 'NtProtectVirtualMemory');
+        if (ntProtectVirtualMemory != null && !exceptionHandlerRegistered) {
             const ntProtectVirtualMemoryListener = Interceptor.attach(ntProtectVirtualMemory, {
                 onEnter: function (args) {
                     let addr = args[1].readPointer();
@@ -286,7 +408,7 @@ rpc.exports = {
         // to get called after new PE images are loaded and before their entry
         // point is called. Needed to unpack DLLs.
         let initializeFusionHooked = false;
-        const activateActivationContext = Module.findExportByName('ntdll', 'RtlActivateActivationContextUnsafeFast');
+        const activateActivationContext = findExport('ntdll', 'RtlActivateActivationContextUnsafeFast');
         const activateActivationContextListener = Interceptor.attach(activateActivationContext, {
             onLeave: function (_args) {
                 if (dumpedModule == null) {
@@ -310,7 +432,7 @@ rpc.exports = {
                 // Hook `clr.InitializeFusion` if present.
                 // This is used to detect a good point during the CLR's
                 // initialization, to dump .NET EXE assemblies
-                const initializeFusion = Module.findExportByName('clr', 'InitializeFusion');
+                const initializeFusion = findExport('clr', 'InitializeFusion');
                 if (initializeFusion != null && !initializeFusionHooked) {
                     const initializeFusionListener = Interceptor.attach(initializeFusion, {
                         onEnter: function (_args) {
@@ -354,7 +476,7 @@ rpc.exports = {
         return moduleNames;
     },
     enumerateModuleRanges: function (moduleName) {
-        let ranges = Process.enumerateRangesSync("r--");
+        let ranges = enumerateReadableRanges();
         return ranges.filter(range => {
             const module = Process.findModuleByAddress(range.base);
             return module != null && module.name.toUpperCase() == moduleName.toUpperCase();
@@ -388,9 +510,9 @@ rpc.exports = {
         return Memory.protect(ptr(address), size, protection);
     },
     readProcessMemory: function (address, size) {
-        return Memory.readByteArray(ptr(address), size);
+        return readByteArray(ptr(address), size);
     },
     writeProcessMemory: function (address, bytes) {
-        return Memory.writeByteArray(ptr(address), bytes);
+        return writeByteArray(ptr(address), bytes);
     }
 };

@@ -10,7 +10,16 @@ from typing import List, Optional
 import lief
 import pyscylla  # type: ignore
 
-from unlicense.lief_utils import lief_pe_data_directories, lief_pe_sections
+from unlicense.lief_utils import (
+    data_directory_resource_table,
+    dll_dynamic_base,
+    header_relocs_stripped,
+    lief_pe_data_directories,
+    lief_pe_sections,
+    section_mem_execute,
+    section_name_str,
+    write_rebuilt_pe,
+)
 
 from .process_control import MemoryRange, ProcessController
 
@@ -44,15 +53,14 @@ def probe_text_sections(pe_file_path: str) -> Optional[List[MemoryRange]]:
     # Note(ergrelet): we thus do not want to include Themida/WinLicense's
     # sections in that list.
     for section in lief_pe_sections(binary):
-        section_name = section.fullname
+        section_name = section_name_str(section)
         stripped_section_name = section_name.replace(' ',
                                                      '').replace('\00', '')
         if len(stripped_section_name) > 0 and \
                 stripped_section_name not in [".text", ".textbss", ".textidx"]:
             break
 
-        if section.has_characteristic(
-                lief.PE.SECTION_CHARACTERISTICS.MEM_EXECUTE):
+        if section.has_characteristic(section_mem_execute()):
             LOG.debug("Probed .text section at (0x%x, 0x%x)",
                       section.virtual_address, section.virtual_size)
             text_sections += [
@@ -146,20 +154,15 @@ def _rebuild_pe(pe_file_path: str, output_file_path: str) -> None:
     _resolve_section_names(binary)
 
     # Disable ASLR
-    binary.header.add_characteristic(
-        lief.PE.HEADER_CHARACTERISTICS.RELOCS_STRIPPED)
-    binary.optional_header.remove(lief.PE.DLL_CHARACTERISTICS.DYNAMIC_BASE)
+    binary.header.add_characteristic(header_relocs_stripped())
+    binary.optional_header.remove(dll_dynamic_base())
     # Rebuild PE
-    builder = lief.PE.Builder(binary)
-    builder.build_dos_stub(True)
-    builder.build_overlay(True)
-    builder.build()
-    builder.write(output_file_path)
+    write_rebuilt_pe(binary, output_file_path)
 
 
 def _resolve_section_names(binary: lief.PE.Binary) -> None:
     for data_dir in lief_pe_data_directories(binary):
-        if data_dir.type == lief.PE.DATA_DIRECTORY.RESOURCE_TABLE and \
+        if data_dir.type == data_directory_resource_table() and \
            data_dir.section is not None:
             LOG.debug(".rsrc section found (RVA=%s)",
                       hex(data_dir.section.virtual_address))
@@ -218,25 +221,30 @@ def pointer_size_to_fmt(pointer_size: int) -> str:
     raise NotImplementedError("Platform not supported")
 
 
+# PE machine field. Compared as integers so lief 0.13 and 1.0 agree.
+IMAGE_FILE_MACHINE_I386 = 0x014C
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+
+
 def interpreter_can_dump_pe(pe_file_path: str) -> bool:
     current_platform = platform.machine()
     binary = lief.parse(pe_file_path)
-    pe_architecture = binary.header.machine
+    pe_architecture = int(binary.header.machine)
 
     # 64-bit OS on x86
     if current_platform == "AMD64":
         bitness = struct.calcsize("P") * 8
         if bitness == 64:
             # Only 64-bit PEs are supported
-            return bool(pe_architecture == lief.PE.MACHINE_TYPES.AMD64)
+            return pe_architecture == IMAGE_FILE_MACHINE_AMD64
         if bitness == 32:
             # Only 32-bit PEs are supported
-            return bool(pe_architecture == lief.PE.MACHINE_TYPES.I386)
+            return pe_architecture == IMAGE_FILE_MACHINE_I386
         return False
 
     # 32-bit OS on x86
     if current_platform == "x86":
         # Only 32-bit PEs are supported
-        return bool(pe_architecture == lief.PE.MACHINE_TYPES.I386)
+        return pe_architecture == IMAGE_FILE_MACHINE_I386
 
     return False

@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -84,10 +85,21 @@ def run_unlicense(
     process_controller = frida_exec.spawn_and_instrument(
         pe_path, text_section_ranges, notify_oep_reached)
     try:
-        # Block until OEP is reached
-        if not oep_reached.wait(float(timeout)):
-            LOG.error("Original entry point wasn't reached before timeout")
-            sys.exit(4)
+        # Block until OEP is reached. A dead process used to sit here for
+        # the whole timeout, then again in teardown.
+        deadline = time.monotonic() + float(timeout)
+        while not oep_reached.is_set():
+            if process_controller.process_exited.is_set():
+                LOG.error(
+                    "Process exited before the original entry point was reached"
+                )
+                sys.exit(4)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                LOG.error(
+                    "Original entry point wasn't reached before timeout")
+                sys.exit(4)
+            oep_reached.wait(min(0.5, remaining))
 
         LOG.info("OEP reached: OEP=%s BASE=%s DOTNET=%r", hex(dumped_oep),
                  hex(dumped_image_base), is_dotnet)

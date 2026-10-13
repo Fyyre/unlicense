@@ -21,7 +21,8 @@ def detect_winlicense_version(pe_file_path: str) -> Optional[int]:
     # for it.
     try:
         if binary.get_section(".themida") is not None or \
-           binary.get_section(".winlice") is not None:
+           binary.get_section(".winlice") is not None or \
+           binary.get_section(".loadcon") is not None:
             return 3
     except lief.not_found:  # type: ignore
         # Not Themida 3.x

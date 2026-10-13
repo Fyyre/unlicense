@@ -30,7 +30,8 @@ def fix_and_dump_pe(process_controller: ProcessController, pe_file_path: str,
     LOG.info("IAT found: %s-%s", hex(iat_addr), hex(iat_addr + iat_range.size))
 
     LOG.info("Resolving imports ...")
-    unwrap_res = _unwrap_iat(iat_range, process_controller)
+    unwrap_res = _unwrap_iat(iat_range, image_base, text_section_range,
+                              process_controller)
     if unwrap_res is None:
         LOG.error("IAT unwrapping failed")
         return
@@ -175,7 +176,12 @@ def _find_iat_from_code_sections(
             biggest_chunk_size = current_chunk_size
 
     iat_candidate_addr = ordered_ptr_list[biggest_chunk_index]
-    iat_candidate_size = biggest_chunk_size
+    # The chunk counter is a number of pointer steps, not a byte length.
+    # A size of 0 still means "no adjacent pointers", which unwrap rejects.
+    if biggest_chunk_size == 0:
+        iat_candidate_size = 0
+    else:
+        iat_candidate_size = (biggest_chunk_size + 1) * pointer_size
     return MemoryRange(iat_candidate_addr, iat_candidate_size, "r--")
 
 
@@ -188,17 +194,15 @@ def _find_iat_start(data: bytes, exports: Dict[int, Dict[str, Any]],
     Returns `None` if this doesn't look like there's an obfuscated IAT in `data`.
     """
     ptr_format = pointer_size_to_fmt(process_controller.pointer_size)
-    elem_count = min(100, len(data) // process_controller.pointer_size)
+    pointer_size = process_controller.pointer_size
+    elem_count = min(100, len(data) // pointer_size)
     LOG.debug("Scanning %d elements, pointer size is %d", elem_count,
-              process_controller.pointer_size)
-    data_size = elem_count * process_controller.pointer_size
-    # Look for beginning of IAT
+              pointer_size)
+    # Look for beginning of IAT. i is a byte offset; the old stop was a
+    # pointer count, so this only walked the first 512 bytes on x64.
     start_offset = 0
-    for i in range(0,
-                   len(data) // process_controller.pointer_size,
-                   process_controller.pointer_size):
-        ptr = struct.unpack(ptr_format,
-                            data[i:i + process_controller.pointer_size])[0]
+    for i in range(0, len(data) - pointer_size + 1, pointer_size):
+        ptr = struct.unpack(ptr_format, data[i:i + pointer_size])[0]
         if ptr in exports:
             start_offset = i
             break
@@ -211,12 +215,14 @@ def _find_iat_start(data: bytes, exports: Dict[int, Dict[str, Any]],
             pass
 
     LOG.debug("Potential start offset %s for the IAT", hex(start_offset))
+    # Count forward from the candidate. The old end stayed inside the first
+    # 100 pointers, so a start past that window counted nothing.
+    end_offset = min(len(data), start_offset + elem_count * pointer_size)
     non_null_count = 0
     valid_ptr_count = 0
     rx_dest_count = 0
-    for i in range(start_offset, data_size, process_controller.pointer_size):
-        ptr = struct.unpack(ptr_format,
-                            data[i:i + process_controller.pointer_size])[0]
+    for i in range(start_offset, end_offset, pointer_size):
+        ptr = struct.unpack(ptr_format, data[i:i + pointer_size])[0]
         if ptr != 0:
             non_null_count += 1
         if ptr in exports:
@@ -239,7 +245,8 @@ def _find_iat_start(data: bytes, exports: Dict[int, Dict[str, Any]],
 
 
 def _unwrap_iat(
-        iat_range: MemoryRange,
+        iat_range: MemoryRange, image_base: int,
+        text_section_range: MemoryRange,
         process_controller: ProcessController) -> Optional[Tuple[int, int]]:
     """
     Resolve wrapped imports from the IAT and fix it in the target process.
@@ -261,6 +268,9 @@ def _unwrap_iat(
     resolved_import_count = 0
     successive_failures = 0
     last_resolution_offset = 0
+    # Import thunks live outside the original code section.
+    code_begin = image_base + text_section_range.base
+    code_end = code_begin + text_section_range.size
     for current_addr in range(iat_range.base, iat_range.base + iat_range.size,
                               process_controller.page_size):
         data_size = process_controller.page_size - (
@@ -280,6 +290,28 @@ def _unwrap_iat(
                     # Note: When TLS callbacks are used, `kernel32.ExitProcess`
                     # is hooked via the IAT and thus might not resolved properly.
                     new_iat_data += struct.pack(ptr_format, exit_process_addr)
+                    LOG.warning(
+                        "A resolved API wasn't an export, thunk=%s resolved=%s, "
+                        "replaced with 'kernel32.ExitProcess'",
+                        hex(wrapper_start),
+                        hex(resolved_api) if isinstance(resolved_api, int) else None)
+                    # A pointer into the original code is past the IAT. Two
+                    # missed resolutions in a row is the older end signal.
+                    in_text = code_begin <= wrapper_start < code_end
+                    missed = (resolved_api is None and
+                              successive_failures >= IAT_MAX_SUCCESSIVE_FAILURES)
+                    if in_text or missed:
+                        if in_text:
+                            LOG.info("Found import table end")
+                        # Remove the last elements
+                        new_iat_data = new_iat_data[:last_resolution_offset + 1]
+                        # Ensure the range is writable
+                        process_controller.set_memory_protection(
+                            iat_range.base, len(new_iat_data), "rw-")
+                        # Update IAT
+                        process_controller.write_process_memory(
+                            iat_range.base, list(new_iat_data))
+                        return len(new_iat_data), resolved_import_count
                 else:
                     LOG.debug("Resolved API: %s -> %s", hex(wrapper_start),
                               hex(resolved_api))
@@ -287,22 +319,7 @@ def _unwrap_iat(
                     resolved_import_count += 1
                     last_resolution_offset = len(new_iat_data)
                     if successive_failures > 0:
-                        LOG.warning(
-                            "A resolved API wasn't an export, "
-                            "it's been replaced with 'kernel32.ExitProcess'.")
                         successive_failures = 0
-
-                # Dumb check to detect the "end" of the IAT
-                if resolved_api is None and successive_failures >= IAT_MAX_SUCCESSIVE_FAILURES:
-                    # Remove the last elements
-                    new_iat_data = new_iat_data[:last_resolution_offset + 1]
-                    # Ensure the range is writable
-                    process_controller.set_memory_protection(
-                        iat_range.base, len(new_iat_data), "rw-")
-                    # Update IAT
-                    process_controller.write_process_memory(
-                        iat_range.base, list(new_iat_data))
-                    return len(new_iat_data), resolved_import_count
             elif wrapper_start in exports_dict:
                 # Not wrapped, add as is
                 new_iat_data += struct.pack(ptr_format, wrapper_start)
